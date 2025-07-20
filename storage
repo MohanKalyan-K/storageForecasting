@@ -1,0 +1,893 @@
+import sys
+import pandas as pd
+import os
+import json
+import requests
+from sklearn.linear_model import LinearRegression, Ridge, Lasso
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.svm import SVR
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from prophet import Prophet
+import numpy as np
+import datetime
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.io import to_html
+import colorsys
+#import matplotlib.cm as cm
+#import matplotlib.pyplot as plt
+import random
+from dateutil.relativedelta import relativedelta
+     
+PersonaId = "455f45b9-897e-434d-af5a-b50c1451ac0d"
+PersonaId_Servers_Data_Analysis = "53db932b-6624-4fca-bec2-3d28aeb65d94"
+Base_URL = 'https://parklandfuelcorp144890-dev.atrmywizard-aiops.com/'
+
+ 
+# Function to read and preprocess the data
+def Read_Servers_Data(Path):
+    if not os.path.exists(Path):
+        print("The provided file path does not exist. Please provide a valid SharePoint link or file path.")
+        exit(0)
+    try:
+        # Load Excel data
+        Servers_Data = pd.read_excel(Path)
+
+        # Check if data is empty
+        if Servers_Data.empty:
+            print("The file is empty.")
+            exit(0)
+
+        # Clean non-numeric characters in numeric columns
+        numeric_columns = ['Storage In Use (TB)', 'Storage Capacity (TB)']
+        for column in numeric_columns:
+            Servers_Data[column] = Servers_Data[column].replace(r'[^\d.]', '', regex=True)
+            Servers_Data[column] = pd.to_numeric(Servers_Data[column], errors='coerce')
+
+        # Calculate Storage Utilization Percentage
+        Servers_Data['Storage Utilization Percentage (%)'] = (
+            (Servers_Data['Storage In Use (TB)'] / Servers_Data['Storage Capacity (TB)']) * 100
+        ).round(0)
+
+        # Fill NaN values in the "Storage_Device" column with the previous value
+        Servers_Data['Storage_Device'] = Servers_Data['Storage_Device'].ffill()
+
+        # Infer objects in the "Storage_Device" column#
+        Servers_Data['Storage_Device'] = Servers_Data['Storage_Device'].infer_objects()
+
+        # Round off numerical values to 2 decimal places for the entire DataFrame
+        Servers_Data = Servers_Data.applymap(lambda x: round(x, 2) if isinstance(x, (int, float)) else x)
+
+        # Save the modified DataFrame back to the Excel file
+        Servers_Data.to_excel(Path, index=False)
+
+        # Convert the data into string    
+        Servers_Data = Servers_Data.astype(str)
+
+        # Format the data into a JSON query
+        Servers_Data_Json = Servers_Data.to_dict(orient="records")
+        formatted_data = json.dumps(Servers_Data_Json, indent=4)
+        return Servers_Data, formatted_data
+
+    except Exception as e:
+        print(f"Error reading Excel file: {e}")
+        exit(0)
+ 
+# Function to get authentication token
+def Get_Token(Token_URL, User_Name, Admin_Password):
+    Payload = json.dumps({
+        "username": User_Name,
+        "password": Admin_Password
+    })
+    Header = {'Content-Type': 'application/json'}
+    try:
+        Token_Response = requests.post(url=Token_URL, headers=Header, data=Payload)
+        Token_Response.raise_for_status()  # Raise an exception for HTTP errors
+        Token = Token_Response.json().get("token")
+        return Token
+    except requests.exceptions.RequestException as e:
+        print(f"Error getting token: {e}")
+        sys.exit(1)
+ 
+# Function to get the response from the Persona API - 1
+def Get_Persona_Response(Base_URL, Input_data, Token):
+    message = {"query": f"Given the following input data, generate a report as described in persona. Focus on the relevant details and avoid unnecessary context. Here is the input data: {Input_data}", "persona_id": PersonaId}
+    try:
+        headers = {
+            'Content-Type': 'application/json',
+            'apiToken': Token
+        }
+        response = requests.post(url=f"{Base_URL}/atr-gateway/genai/query-generation", headers=headers, json=message)
+        response.raise_for_status()
+        resp = response.json()["response"]
+        print("Persona response = ", resp)
+        return resp
+    except requests.exceptions.RequestException as e:
+        print(f"Error calling API: {e}")
+        sys.exit(1)
+
+# Function to get the response from the Persona API - 2
+def Get_Persona_Response_Prediction_Analysis(Base_URL, Servers_Data, Token):
+    # removed = Servers_Data.loc[:, Servers_Data.columns != 'Storage_Type']
+    message = {"query": f"Given the following input data, generate a report as described in persona. Focus on the relevant details and avoid unnecessary context. Here is the input data: {Servers_Data}", "persona_id": PersonaId_Servers_Data_Analysis}
+    try:
+        headers = {
+            'Content-Type': 'application/json',
+            'apiToken': Token
+        }
+        timeout = 180
+        response = requests.post(url=f"{Base_URL}/atr-gateway/genai/query-generation", headers=headers, json=message, timeout=timeout)
+        response.raise_for_status()
+        resp = response.json()["response"]
+        print("Persona response = ", resp)
+        return resp
+    except requests.exceptions.RequestException as e:
+        print(f"Error calling API: {e}")
+        sys.exit(1)
+ 
+# Function to clean data
+def Clean_Data(Servers_Data):
+    numeric_columns = ['Storage In Use (TB)', 'Storage Capacity (TB)']  # Add other columns
+    for column in numeric_columns:
+        # Use .loc to avoid SettingWithCopyWarning
+        print(column)
+        print(Servers_Data[column])
+        Servers_Data.loc[:, column] = Servers_Data[column].replace(r'[^\d.]', '', regex=True)
+        Servers_Data.loc[:, column] = pd.to_numeric(Servers_Data[column], errors='coerce')
+    Servers_Data['Storage In Use (TB)'] = Servers_Data['Storage In Use (TB)'].fillna(0)
+    Servers_Data['Storage Capacity (TB)'] = Servers_Data['Storage Capacity (TB)'].fillna(0)
+    return Servers_Data
+ 
+# Function to get ML predictions for various models
+def Get_ML_Predictions(Model_Name, Servers_Data):
+    if Servers_Data is None or Servers_Data.empty:
+        print("Error: Servers_Data is empty or None!")
+        return
+
+    Servers_Data = Clean_Data(Servers_Data)  # Clean the data and receive cleaned data back
+    print(Servers_Data)
+    results = {}
+    
+    # Get Datastore Capacity (TB) from the first cluster (assuming it's the same for all)
+    datastore_capacity = Servers_Data['Storage Capacity (TB)'].iloc[0]
+    
+    # Generate month-wise dates from today
+    today = datetime.datetime.today().date()
+    #future_dates = [today + datetime.timedelta(days=30 * i) for i in range(6)]  # Next 6 months
+    future_dates = [today + relativedelta(months=i) for i in range(6)]
+    
+    for cluster in Servers_Data['Storage_Device'].unique():
+        cluster_data = Servers_Data[Servers_Data['Storage_Device'] == cluster]
+        if 'k-Nearest Neighbors' in Model_Name:
+            forecast = KNN_Prediction(cluster_data)
+        elif 'ARIMA' in Model_Name:
+            forecast = ARIMA_Prediction(cluster_data)
+        elif 'Linear Regression' in Model_Name:
+            forecast = Linear_Regression_Prediction(cluster_data)
+        elif 'Polynomial Regression' in Model_Name:
+            forecast = Polynomial_Regression_Prediction(cluster_data)
+        elif 'Random Forest' in Model_Name:
+            forecast = Random_Forest_Prediction(cluster_data)
+        elif 'Gradient Boosting Machines' in Model_Name:
+            forecast = Gradient_Boosting_Prediction(cluster_data)
+        elif 'Support Vector Machines' in Model_Name:
+            forecast = SVR_Prediction(cluster_data)
+        elif 'SARIMA' in Model_Name:
+            forecast = SARIMA_Prediction(cluster_data)
+        else:
+            print(f"Model {Model_Name} not available!")
+            continue
+        
+        # Create a DataFrame with the results
+        forecast_df = pd.DataFrame({
+            'Storage_Device': [cluster] * len(future_dates),
+            'Date': future_dates,
+            'Storage Capacity (TB)': [datastore_capacity] * len(future_dates),
+            'Predicted Storage Utilization (TB)': forecast
+        })
+        
+        results[cluster] = forecast_df
+        print(results)
+    return results
+
+# ARIMA Prediction
+def ARIMA_Prediction(Servers_Data):
+    Servers_Data['Date'] = pd.to_datetime(Servers_Data['Date'])
+    series = Servers_Data.groupby('Date')['Storage In Use (TB)'].mean()
+    model = ARIMA(series, order=(5, 1, 0))
+    model_fit = model.fit()
+    forecast = model_fit.forecast(steps=6)
+    print(f"ARIMA Predicted Datastore Utilization for next 6 months:\n{forecast}")
+    return forecast
+
+# SARIMA Prediction
+def SARIMA_Prediction(Servers_Data):
+    Servers_Data['Date'] = pd.to_datetime(Servers_Data['Date'])
+    series = Servers_Data.groupby('Date')['Storage In Use (TB)'].mean()
+    
+    # Ensure SARIMAX has a frequency set on the date index
+    series = series.asfreq('D').fillna(method='ffill')  # Forward fill missing values
+    
+    model = SARIMAX(series, order=(1, 1, 1), seasonal_order=(1, 1, 1, 12))
+    model_fit = model.fit(disp=False)
+    
+    forecast = model_fit.forecast(steps=6)
+    print(f"Predicted Datastore Utilization for next 6 months:\n{forecast}")
+    return forecast
+
+# Linear Regression Prediction
+def Linear_Regression_Prediction(Servers_Data):
+    Servers_Data['Date'] = pd.to_datetime(Servers_Data['Date'])
+    X = pd.to_numeric(Servers_Data['Date'].dt.month).values.reshape(-1, 1)
+    y = Servers_Data['Storage In Use (TB)'].values
+    model = LinearRegression()
+    model.fit(X, y)
+
+    # Get last month in the training data
+    last_month = X[-1, 0]
+
+    # Generate next 6 months
+    future_months = np.array([last_month + i for i in range(1, 7)]).reshape(-1, 1)
+    forecast = model.predict(future_months)
+    print(f"Linear Regression Predicted Datastore Utilization for next 6 months:\n{forecast}")
+    return forecast
+
+# Polynomial Regression Prediction
+def Polynomial_Regression_Prediction(Servers_Data):
+    Servers_Data['Date'] = pd.to_datetime(Servers_Data['Date'])
+    X = pd.to_numeric(Servers_Data['Date'].dt.month).values.reshape(-1, 1)
+    y = Servers_Data['Storage In Use (TB)'].values
+    poly = PolynomialFeatures(degree=3)
+    X_poly = poly.fit_transform(X)
+    model = LinearRegression()
+    model.fit(X_poly, y)
+
+    # Get last month in the training data
+    last_month = X[-1, 0]
+
+    # Generate next 6 months
+    future_months = np.array([last_month + i for i in range(1, 7)]).reshape(-1, 1)
+    future_poly = poly.transform(future_months)
+    forecast = model.predict(future_poly)
+    print(f"Polynomial Regression Predicted Datastore Utilization for next 6 months:\n{forecast}")
+    return forecast
+
+# Random Forest Prediction
+def Random_Forest_Prediction(Servers_Data):
+    Servers_Data['Date'] = pd.to_datetime(Servers_Data['Date'])
+    X = pd.to_numeric(Servers_Data['Date'].dt.month).values.reshape(-1, 1)
+    y = Servers_Data['Storage In Use (TB)'].values
+    model = RandomForestRegressor(n_estimators=100)
+    model.fit(X, y)
+
+    # Get last month in the training data
+    last_month = X[-1, 0]
+    
+    # Generate next 6 months
+    forecast = model.predict(np.array([last_month + i for i in range(1, 7)]).reshape(-1, 1))
+    print(f"Random Forest Predicted Datastore Utilization for next 6 months:\n{forecast}")
+    return forecast
+
+# Gradient Boosting Prediction
+def Gradient_Boosting_Prediction(Servers_Data):
+    Servers_Data['Date'] = pd.to_datetime(Servers_Data['Date'])
+    X = pd.to_numeric(Servers_Data['Date'].dt.month).values.reshape(-1, 1)
+    y = Servers_Data['Storage In Use (TB)'].values
+    model = GradientBoostingRegressor(n_estimators=100)
+    model.fit(X, y)
+
+    # Get last month in the training data
+    last_month = X[-1, 0]
+    
+    # Generate next 6 months
+    forecast = model.predict(np.array([last_month + i for i in range(1, 7)]).reshape(-1, 1))
+    print(f"Gradient Boosting Predicted Datastore Utilization for next 6 months:\n{forecast}")
+    return forecast
+
+# Support Vector Machine Prediction
+def SVR_Prediction(Servers_Data):
+    Servers_Data['Date'] = pd.to_datetime(Servers_Data['Date'])
+    X = pd.to_numeric(Servers_Data['Date'].dt.month).values.reshape(-1, 1)
+    y = Servers_Data['Storage In Use (TB)'].values
+    model = SVR(kernel='linear')
+    model.fit(X, y)
+
+    # Get last month in the training data
+    last_month = X[-1, 0]
+
+    # Generate next 6 months
+    forecast = model.predict(np.array([last_month + i for i in range(1, 7)]).reshape(-1, 1))
+    print(f"SVR Predicted Datastore Utilization for next 6 months:\n{forecast}")
+    return forecast
+ 
+# k-Nearest Neighbors Prediction
+def KNN_Prediction(Servers_Data):
+    Servers_Data['Date'] = pd.to_datetime(Servers_Data['Date'])
+    X = pd.to_numeric(Servers_Data['Date'].dt.month).values.reshape(-1, 1)
+    y = Servers_Data['Storage In Use (TB)'].values
+    n_samples = len(X)
+    n_neighbors = min(5, n_samples) 
+    model = KNeighborsRegressor(n_neighbors=n_neighbors)
+    model.fit(X, y)
+
+    # Get last month in the training data
+    last_month = X[-1, 0]
+
+    # Generate next 6 months
+    forecast = model.predict(np.array([last_month + i for i in range(1, 7)]).reshape(-1, 1))
+    print(f"KNN Predicted Datastore Utilization for next 6 months:\n{forecast}")
+    return forecast
+
+def Process_Clusters_And_Get_Predictions(Servers_Data, Token, Base_URL):
+    clusters = Servers_Data['Storage_Device'].unique()
+    print(clusters)
+    all_predictions = []
+    for cluster in clusters:
+        cluster_data = Servers_Data[Servers_Data['Storage_Device'] == cluster]
+        print(cluster_data)
+        formatted_data = format_cluster_data(cluster_data)
+        print(formatted_data)
+        Persona_Response = Get_Persona_Response(Base_URL, formatted_data, Token)
+      
+        # Safe parsing
+        try:
+            Model_Name = Persona_Response.split("Model Name:")[1].split("Reason:")[0].strip()
+            Reason = Persona_Response.split("Reason:")[1].strip()
+        except (IndexError, ValueError):
+            print(f"Error: Could not parse Model Name or Reason from Persona Response for cluster {cluster}.")
+            continue
+        
+        Predictions = Get_ML_Predictions(Model_Name, cluster_data)
+        if not Predictions:
+            print(f"Warning: No predictions found for cluster {cluster}.")
+            continue
+        for cluster, forecast_df in Predictions.items():
+            forecast_df['Storage_Device'] = cluster
+            forecast_df['Model'] = Model_Name
+            all_predictions.append(forecast_df)
+    if all_predictions:
+        all_predictions_df = pd.concat(all_predictions, ignore_index=True)
+        return all_predictions_df
+    else:
+        print("Error: No predictions generated.")
+        return pd.DataFrame()
+  
+# Function to format cluster data
+def format_cluster_data(cluster_data):
+    required_columns = ['Storage_Type','Storage_Device', 'Date', 'Storage Capacity (TB)', 'Storage In Use (TB)', 'Storage Free (TB)', 'Storage Utilization Percentage (%)']
+    # Identify missing columns
+    missing_columns = [col for col in required_columns if col not in cluster_data.columns]
+    
+    if missing_columns:
+        raise ValueError(f"Missing required columns in cluster data: {missing_columns}")
+
+    formatted_data = {
+        "Storage_Type": cluster_data['Storage_Type'].iloc[0],
+        "Storage_Device": cluster_data['Storage_Device'].iloc[0],
+        "servers": []
+    }
+    for _, row in cluster_data.iterrows():
+        server_info = {
+            "Storage Capacity (TB)": row['Storage Capacity (TB)'],
+            "Storage In Use (TB)": row['Storage In Use (TB)'],
+            "Storage Free (TB)": row['Storage Free (TB)'],
+            "Storage Utilization Percentage (%)": row['Storage Utilization Percentage (%)']
+        }
+        formatted_data["servers"].append(server_info)
+    return json.dumps(formatted_data)
+ 
+def Growth_Level(Servers_Data):
+    clusters = Servers_Data['Storage_Device'].unique()
+    dict1 = {}
+    for cluster in clusters:
+        cluster_data = Servers_Data[Servers_Data['Storage_Device'] == cluster]
+        first = float(cluster_data['Storage In Use (TB)'].iloc[0])
+        last = float(cluster_data['Storage In Use (TB)'].iloc[-1])
+        growth_percentage = round(((last - first) / first) * 100, 0)
+        dict1[cluster] = growth_percentage
+    print("dict = ", dict1)
+    # Categorize clusters based on growth percentage
+    above_90 = [cluster for cluster, growth in dict1.items() if growth > 90]
+    below_90 = [cluster for cluster, growth in dict1.items() if 60 < growth <= 90]
+    below_60 = [cluster for cluster, growth in dict1.items() if growth <= 60]
+    
+    # Generate HTML
+    html = """
+    <div class="container">
+        <!-- Growth Rate Analysis Table -->
+        <table>
+            <tr>
+                <th colspan="3">Growth Rate Levels</th>
+            </tr>
+            <tr>
+                <th>Above 90%</th>
+                <th>Between 60%-90%</th>
+                <th>Below 60%</th>
+            </tr>
+            <tr>
+                <td>{}</td>
+                <td>{}</td>
+                <td>{}</td>
+            </tr>
+        </table>
+    </div>
+    """.format(", ".join(above_90), ", ".join(below_90), ", ".join(below_60))
+ 
+    print(html)
+    return html, dict1
+ 
+def Generate_HTML_Report(Servers_Data, Predictions, Analysis, Growth__Level_Calculation, output_file_path="UC_IO_Stg_Capacity_Planning/Ticket Forecast/Scripts/Storage_Capacity_Planning.html"):
+    html_content = """
+    <html>
+    <head>
+        <title>Intelligent Capacity Planning Report</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; }}
+            table {{ width: 80%; border-collapse: collapse; margin: 20px auto; border-radius: 8px; overflow: hidden; text-align: center; }}
+            th, td {{ padding: 8px; text-align: center; border: 1px solid #ddd; border-radius: 8px; }}
+            th {{ background-color: #4CAF50; color: white; }}
+            ul {{ margin: 20px; padding-left: 20px; }}
+            li {{ margin: 10px 0; font-size: 16px; }}
+            h1 {{ color: #333; text-align: center; }}
+            h2 {{ text-align: center; }}
+            h3 {{ text-align: left; }}
+            p {{ text-align: justify; }}
+            .graph-container {{ display: flex; justify-content: space-around; flex-wrap: wrap; gap: 20px; width: 90%; margin: 20px auto; }}
+            .graph {{ width: 75%; height: 600px; overflow-y: scroll; max-height: 700px; }}  
+            .table-container {{ margin-top: 40px; }}
+            .merged-column {{ text-align: center; }}
+            .table-container h3 {{ text-align: center; }}
+            .container {{ text-align: justify; width: 80%; margin-left: 150px; }}
+        </style>
+    </head>
+    <body>
+        <h1>Intelligent Capacity Planning Report</h1>
+        <h2>Past Cycle Storage Table</h2>
+        {server_table}
+        
+        <div class="graph-container">
+            <div class="graph">
+                <h3>Graph 1: Storage Utilization Percentage (%) of Each Storage device</h3>
+                {graph1}
+            </div>
+            <div class="graph">
+                <h3>Graph 2: Average Percentage of Storage Utilization</h3>
+                {graph2}
+            </div>
+        </div>
+        
+        <div class="graph-container">
+            <div class="graph">
+                <h3>Graph 3: Overall Utilization Growth rate Percentage of each Storage Device</h3>
+                {graph3}
+            </div>
+            <div class="graph">
+                <h3>Graph 4: Predicted Storage Utilization for Next 6 Months</h3>
+                {graph4}
+            </div>
+        </div>
+
+        <div class="table-container">
+            <h3>Future Predictions Table</h3>
+            {predictions_table}
+        </div>
+    """
+    html_content += Growth__Level_Calculation
+    html_content += Analysis
+    
+    html_content += """
+    </body>
+    </html>
+    """
+
+    # ---------------------------
+    # Step 1: Clean 'Storage In Use (TB)' column
+    # ---------------------------
+    Servers_Data['Storage Utilization Percentage (%)'] = pd.to_numeric(
+    Servers_Data['Storage Utilization Percentage (%)'], errors='coerce'
+    )
+
+    
+    # ---------------------------
+    # Step 2: Format 'Date' column
+    # ---------------------------
+    Servers_Data['Date'] = pd.to_datetime(Servers_Data['Date']).dt.strftime('%b-%Y')
+    server_table_html = Servers_Data.to_html(index=False)
+    
+    # ---------------------------
+    # Step 3: Generate perceptually distinct colors
+    # ---------------------------
+    def generate_maximally_distinct_colors(n):
+        def distance(c1, c2):
+            return np.linalg.norm(np.array(c1) - np.array(c2))
+        
+        def is_far_enough(color, existing, min_dist=100):
+            return all(distance(color, c) >= min_dist for c in existing)
+    
+        # Build candidate color pool (RGB grid)
+        candidates = [(r, g, b) for r in range(0, 256, 32)
+                                for g in range(0, 256, 32)
+                                for b in range(0, 256, 32)]
+        random.shuffle(candidates)
+        selected = []
+    
+        for color in candidates:
+            if len(selected) >= n:
+                break
+            if is_far_enough(color, selected, min_dist=80):  # Adjust min_dist if needed
+                selected.append(color)
+    
+        # Fallback: pad with random colors if not enough
+        while len(selected) < n:
+            selected.append((random.randint(0, 255), random.randint(0, 255), random.randint(0, 255)))
+    
+        # Convert to HEX
+        hex_colors = ['#%02x%02x%02x' % rgb for rgb in selected]
+        return hex_colors
+    
+    # ---------------------------
+# Step 4: Prepare device list and color map
+# ---------------------------
+    unique_types = Servers_Data['Storage_Type'].unique()
+    
+    # Create a dictionary to store HTML for each subgraph
+    graphs_html_by_type = {}
+    
+    # ---------------------------
+    # Step 5: Loop through each Storage Type and create individual line charts
+    # ---------------------------
+    for Storage_Type in unique_types:
+        # Filter data for the current storage type
+        type_data = Servers_Data[Servers_Data['Storage_Type'] == Storage_Type]
+        
+        # Get unique devices and color map for this storage type
+        unique_devices = type_data['Storage_Device'].unique()
+        n_clusters = len(unique_devices)
+        color_list = generate_maximally_distinct_colors(n_clusters)
+        color_map = {device: color_list[i] for i, device in enumerate(unique_devices)}
+        
+        # Create the line chart for the current storage type
+        fig = go.Figure()
+        
+        for device in unique_devices:
+            device_data = type_data[type_data['Storage_Device'] == device]
+            fig.add_trace(go.Scatter(
+                x=device_data['Date'],
+                y=device_data['Storage Utilization Percentage (%)'],
+                mode='lines+markers',
+                name=device,
+                line=dict(color=color_map[device])
+            ))
+        
+        # Layout and styling
+        fig.update_layout(
+            title=f'Month vs Datastore Utilization - Storage Type: {Storage_Type}',
+            xaxis_title='Month',
+            yaxis_title='Storage Utilization Percentage (%)',
+            width=1200,
+            height=600,
+            barmode='group',
+            legend=dict(
+                orientation='v',
+                x=1.02,
+                y=1,
+                xanchor='left',
+                yanchor='top'
+            )
+        )
+        
+        # Convert to HTML and store in dictionary
+        graphs_html_by_type[Storage_Type] = to_html(fig, full_html=False)
+
+# Now, graphs_html_by_type contains individual HTML graphs keyed by storage type.
+
+    
+    
+    # ---------------------------
+    # Step 8: Generate Graph 2 - Cluster vs Average Percentage of Datastore Utilization
+    # ---------------------------
+    
+    # Group by Storage_Device and calculate average utilization
+    avg_utilization = Servers_Data.groupby('Storage_Device')['Storage Utilization Percentage (%)'].mean().reset_index()
+    
+    # ---------------------------
+    # Generate distinct colors
+    # ---------------------------
+    def generate_maximally_distinct_colors(n):
+        def distance(c1, c2):
+            return np.linalg.norm(np.array(c1) - np.array(c2))
+        
+        def is_far_enough(color, existing, min_dist=100):
+            return all(distance(color, c) >= min_dist for c in existing)
+    
+        # Candidate RGB values (spaced out)
+        candidates = [(r, g, b) for r in range(0, 256, 32)
+                                for g in range(0, 256, 32)
+                                for b in range(0, 256, 32)]
+        random.shuffle(candidates)
+        selected = []
+    
+        for color in candidates:
+            if len(selected) >= n:
+                break
+            if is_far_enough(color, selected, min_dist=80):
+                selected.append(color)
+    
+        # Fallback: pad if needed
+        while len(selected) < n:
+            selected.append((random.randint(0, 255), random.randint(0, 255), random.randint(0, 255)))
+    
+        # Convert to HEX
+        return ['#%02x%02x%02x' % rgb for rgb in selected]
+    
+    # Get unique devices and assign colors
+    unique_devices_2 = avg_utilization['Storage_Device'].unique()
+    color_list_2 = generate_maximally_distinct_colors(len(unique_devices_2))
+    color_map_2 = {device: color_list_2[i] for i, device in enumerate(unique_devices_2)}
+    
+    # ---------------------------
+    # Create bar chart using go.Figure
+    # ---------------------------
+    fig2 = go.Figure()
+    
+    for device in unique_devices_2:
+        device_data = avg_utilization[avg_utilization['Storage_Device'] == device]
+        fig2.add_trace(go.Bar(
+            x=[device],
+            y=device_data['Storage Utilization Percentage (%)'],
+            name=device,
+            marker_color=color_map_2[device]
+        ))
+    
+    # ---------------------------
+    # Update layout
+    # ---------------------------
+    fig2.update_layout(
+        title='Storage Device vs Average Percentage of Storage Utilization',
+        xaxis_title='Storage Device',
+        yaxis_title='Average Utilization (%)',
+        width=1200,
+        height=600,
+        legend=dict(
+            orientation='v',
+            x=1.02,
+            y=1,
+            xanchor='left',
+            yanchor='top'
+        )
+    )
+    
+    # ---------------------------
+    # Convert to HTML for embedding
+    # ---------------------------
+    graph2_html = to_html(fig2, full_html=False)
+
+    # ---------------------------
+    # Step 9: Generate Graph 3 - Cluster vs Utilization Growth Rate Percentage (Line Chart)
+    # ---------------------------
+    growth_rate_df = calculate_growth_rate(Servers_Data)
+    
+    # Sort if needed
+    growth_rate_df = growth_rate_df.sort_values(by='Growth Rate (%)', ascending=False)
+    
+    # Unique devices and colors
+    unique_clusters_3 = growth_rate_df['Storage_Device'].unique()
+    color_list_3 = generate_maximally_distinct_colors(len(unique_clusters_3))
+    color_map_3 = {device: color_list_3[i] for i, device in enumerate(unique_clusters_3)}
+     
+    # Create bar chart with one trace per device
+    fig3 = go.Figure()
+    
+    for device in unique_clusters_3:
+        value = growth_rate_df[growth_rate_df['Storage_Device'] == device]['Growth Rate (%)'].values[0]
+        fig3.add_trace(go.Bar(
+            x=[device],
+            y=[value],
+            name=device,
+            marker_color=color_map_3[device]
+        ))
+     
+    # Layout
+    fig3.update_layout(
+        title='Storage Device vs Utilization Growth Rate Percentage',
+        xaxis_title='Storage Device',
+        yaxis_title='Growth Rate (%)',
+        width=1200,
+        height=600,
+        legend=dict(
+            orientation='v',
+            x=1.02,
+            y=1,
+            xanchor='left',
+            yanchor='top'
+        )
+    )
+    
+    graph3_html = to_html(fig3, full_html=False)
+
+
+    # ---------------------------
+    # Step 10: Generate Graph 4 - Month vs Predicted Datastore Utilization for Next 6 Months (Line Graph)
+    # ---------------------------
+    
+    # Get predicted data
+    predicted_utilization = get_predicted_utilization(Predictions)
+    
+    # Format 'Date'
+    predicted_utilization['Date'] = pd.to_datetime(predicted_utilization['Date']).dt.strftime('%b-%Y')
+    
+    # Generate distinct colors
+    unique_clusters_4 = predicted_utilization['Storage_Device'].unique()
+    color_list_4 = generate_maximally_distinct_colors(len(unique_clusters_4))
+    color_map_4 = {cluster: color_list_4[i] for i, cluster in enumerate(unique_clusters_4)}
+    
+    # Create line chart
+    fig4 = go.Figure()
+    
+    for cluster in unique_clusters_4:
+        cluster_data = predicted_utilization[predicted_utilization['Storage_Device'] == cluster]
+        fig4.add_trace(go.Scatter(
+            x=cluster_data['Date'],
+            y=cluster_data['Predicted Storage Utilization (TB)'],
+            mode='lines+markers',
+            name=cluster,
+            line=dict(color=color_map_4[cluster])
+        ))
+    
+    # Layout settings
+    fig4.update_layout(
+        title='Month vs Predicted Storage Utilization for Next 6 Months',
+        xaxis_title='Month',
+        yaxis_title='Predicted Utilization (TB)',
+        width=1200,
+        height=600,
+        legend=dict(
+            orientation='v',
+            x=1.02,
+            y=1,
+            xanchor='left',
+            yanchor='top'
+        )
+    )
+     
+    # Convert to HTML
+    graph4_html = to_html(fig4, full_html=False)
+
+    # Step 11: Predictions Table (with rounded values for "Predicted Datastore Utilization (TB)")
+    predictions_table_html = generate_predictions_table(Predictions)
+
+    # Step 12: Write to HTML file
+    combined_graphs_html = ''.join(graphs_html_by_type.values())
+    with open(output_file_path, "w") as file:
+        file.write(html_content.format(
+            server_table=server_table_html,
+            graph1=combined_graphs_html,
+            graph2=graph2_html,
+            graph3=graph3_html,
+            graph4=graph4_html,
+            predictions_table=predictions_table_html
+        ))
+
+    print(f"HTML Report saved at {output_file_path}")
+      
+# Function to calculate utilization growth rate
+def calculate_growth_rate(Servers_Data): 
+    growth_data = []
+    # Ensure column is numeric
+    Servers_Data['Storage In Use (TB)'] = pd.to_numeric(Servers_Data['Storage In Use (TB)'], errors='coerce')
+    # Ensure Date is datetime
+    Servers_Data['Date'] = pd.to_datetime(Servers_Data['Date'], errors='coerce')
+
+    for cluster in Servers_Data['Storage_Device'].unique():
+        cluster_data = Servers_Data[Servers_Data['Storage_Device'] == cluster].copy()
+        # Sort by date to ensure correct order
+        cluster_data = cluster_data.sort_values(by='Date')
+        # Get first and last values, ignoring NaNs
+        cleaned_data = cluster_data['Storage In Use (TB)'].dropna()
+        if not cleaned_data.empty and len(cleaned_data) > 1:
+            first = cleaned_data.iloc[0]
+            last = cleaned_data.iloc[-1]
+            if first != 0:
+                growth_percentage = round(((last - first) / first) * 100, 0)
+            else:
+                growth_percentage = None
+        else:
+            growth_percentage = None
+
+        growth_data.append({
+            'Storage_Device': cluster,
+            'Growth Rate (%)': growth_percentage
+        })
+    return pd.DataFrame(growth_data)
+
+# Function to get predicted utilization
+def get_predicted_utilization(Predictions):
+    # Debugging: Check type of Predictions
+    print(f"Predictions type: {type(Predictions)}")
+    
+    # If it's a DataFrame, use it directly
+    if isinstance(Predictions, pd.DataFrame):
+        predicted_data = Predictions
+    elif isinstance(Predictions, np.ndarray):
+        predicted_data = pd.DataFrame(Predictions)
+    else:
+        raise TypeError("Predictions must be a DataFrame or a numpy ndarray")
+    
+    # Convert the 'Date' to datetime format and 'Predicted Datastore Utilization (TB)' to numeric
+    predicted_data['Date'] = pd.to_datetime(predicted_data['Date'])
+    predicted_data['Predicted Storage Utilization (TB)'] = predicted_data['Predicted Storage Utilization (TB)'].astype(float)
+    
+    return predicted_data[['Date', 'Predicted Storage Utilization (TB)', 'Storage_Device']]
+
+# Helper function to round Predicted Datastore Utilization
+def generate_predictions_table(Predictions):
+    # Make a copy of the Predictions DataFrame
+    predictions_df = Predictions.copy()
+
+    # Convert 'Date' column to the desired format
+    predictions_df['Date'] = pd.to_datetime(predictions_df['Date']).dt.strftime('%b-%Y')
+
+    # Round the 'Predicted Storage Utilization (TB)' to 2 decimal places
+    predictions_df['Predicted Storage Utilization (TB)'] = predictions_df['Predicted Storage Utilization (TB)'].round(2)
+
+    # Function to merge columns by repeating the first value in the group and leaving other values empty
+    def merge_column_values(series):
+        return series.where(series != series.shift(), '')
+
+    # Merge 'Cluster' and 'Model' columns by repeating the value across their respective rows
+    predictions_df['Storage_Device'] = merge_column_values(predictions_df['Storage_Device'])
+    predictions_df['Model'] = merge_column_values(predictions_df['Model'])
+    
+    # Apply HTML formatting to non-empty values in the 'Cluster' and 'Model' columns
+    predictions_df['Model'] = predictions_df['Model'].apply(lambda x: f'<div class="merged-column">{x}</div>' if x != '' else '')
+    predictions_df['Storage_Device'] = predictions_df['Storage_Device'].apply(lambda x: f'<div class="merged-column">{x}</div>' if x != '' else '')
+    
+    
+    # Convert the DataFrame to HTML and replace <td> tags for centered alignment
+    predictions_table_html = predictions_df.to_html(index=False, escape=False)
+    
+    # Ensure centered text alignment for each cell
+    predictions_table_html = predictions_table_html.replace('<td>', '<td style="text-align:center;">')
+
+    return predictions_table_html
+
+
+# Main entry point
+if __name__ == "__main__":
+    args = sys.argv
+    Base_URL = args[1]
+    user_name = args[2]
+    admin_password = args[3]
+    Ticket_Number = args[4]
+    File_Path = args[5]
+    
+    Token_URL = f'{Base_URL}/atr-gateway/identity-management/api/v1/auth/token?useDeflate=true'
+
+    Servers_Data, formatted_data = Read_Servers_Data(File_Path)
+    Servers_Data.columns = Servers_Data.columns.str.strip()
+    print("Servers_Data.columns\n",Servers_Data.columns)
+    print("Read_Servers_Data Completed")
+    
+    Token = Get_Token(Token_URL, user_name, admin_password)
+    print("Get_Token Completed")
+    
+    # Get predictions using the model selected by Persona
+    Predictions = Process_Clusters_And_Get_Predictions(Servers_Data, Token, Base_URL)
+    print("Predictions Type = ", type(Predictions))
+    print("Get_ML_Predictions completed\n", Predictions)
+  
+    Growth__Level_Calculation, dict1 = Growth_Level(Servers_Data)
+    Analysis = Get_Persona_Response_Prediction_Analysis(Base_URL, dict1, Token)
+    if "```html" in Analysis and "```" in Analysis:
+        Analysis = Analysis.split("```html")[1].split("```")[0]
+        print(Analysis)
+    print("Type of Servers_Data = ", type(Servers_Data))
+    print("Type of Predictions = ", type(Predictions))
+    print("Type of Analysis = ", type(Analysis))
+    
+    Generate_HTML_Report(Servers_Data, Predictions, Analysis, Growth__Level_Calculation)
